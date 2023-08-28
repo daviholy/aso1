@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "crs"
+version = "0.1.0"
+description = ""
+authors = ["David Holý <david.holy225@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "~3.11"
+scipy = "^1.11.2"
+matplotlib = "^3.7.2"
+wfdb = "^4.1.2"
+seaborn = "^0.12.2"
+typer = "^0.9.0"
+rich = "^13.5.2"
+numpy = "^1.25.2"
+plotly-express = "^0.4.1"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.7.0"
+debugpy = "^1.6.7.post1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
