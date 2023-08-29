@@ -2,11 +2,13 @@ import os
 from concurrent.futures import Future, ProcessPoolExecutor
 from math import ceil
 from pathlib import Path
-from typing import Annotated, Generator, Union
+from typing import Annotated, Generator, Union, cast
 
 import numpy as np
 import typer
 from rich.progress import Progress
+
+from .config import load_config
 
 from .filters import Anomaly, AnomalyType, Signal, SignalType
 
@@ -57,14 +59,27 @@ def check(
     signal_type: Annotated[
         SignalType, typer.Argument(help="which signal type to look at")
     ],
+    window_size: Annotated[
+        Union[None, float],
+        typer.Option(help="Set length of the window.  Only works for single anomaly."),
+    ] = None,
+    th: Annotated[
+        Union[None, float],
+        typer.Option(
+            help="Threshold for looking anomaly. Only works for single anomaly."
+        ),
+    ] = None,
     anomaly_type: Annotated[
-        AnomalyType, typer.Argument(help="which anomaly to check for")
-    ],
-    window_size: Annotated[float, typer.Option(help="set length of the window")],
-    th: Annotated[float, typer.Option(help="threshold for looking anomaly")],
+        Union[None, AnomalyType],
+        typer.Argument(
+            help="which anomaly to check for. If not specified check for all anomalies. Only works for single anomaly."
+        ),
+    ] = None,
     stride: Annotated[
         Union[None, float],
-        typer.Option(help="stride (shift between sections) for rolling window. Shift 1 by default."),
+        typer.Option(
+            help="stride (shift between sections) for rolling window. Shift 1 by default. Only works for single anomaly."
+        ),
     ] = None,
     input: Annotated[
         Path,
@@ -80,39 +95,86 @@ def check(
     """
     Check and return sectors of given anomaly of specified signal/s
     """
+    config = load_config()
     files = list(dataset_files(input))
-    futures: list[Future] = []
     with Progress() as progress:
         experiment_file = progress.add_task(
             "iterating over files",
             total=len(files),
         )
+        futures = []
+        anomalies: list[list[Anomaly]] = []
         # start processing files on separate processes
         with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-            for file in files:
-                futures.append(
-                    executor.submit(
-                        process_signal,
-                        anomaly_type,
-                        th,
-                        window_size,
-                        signal_type,
-                        file,
-                        stride,
+            if anomaly_type:  # process single specified anomaly type
+                futures = cast(list[Future], futures)
+                for file in files:
+                    futures.append(
+                        executor.submit(
+                            process_signal,
+                            anomaly_type,
+                            th if th else getattr(config, anomaly_type).th,
+                            window_size
+                            if window_size
+                            else getattr(config, anomaly_type).window_size,
+                            signal_type,
+                            file,
+                            stride if stride else getattr(config, anomaly_type).stride,
+                        )
                     )
-                )
 
-            # monitor procceses if they are all finished and updating progress bar
-            while (n_finished := sum([future.done() for future in futures])) < len(
-                futures
-            ):
-                progress.update(
-                    experiment_file, completed=n_finished, total=len(futures)
-                )
+                # monitor procceses if they are all finished and updating progress bar
+                while (n_finished := sum([future.done() for future in futures])) < len(
+                    futures
+                ):
+                    progress.update(
+                        experiment_file, completed=n_finished, total=len(futures)
+                    )
 
-        anomalies: list[list[Anomaly]] = [future.result() for future in futures]
+                anomalies = [future.result() for future in futures]
 
-        progress.update(experiment_file, visible=False)
+            else:  # process for all anomaly types
+                futures = cast(list[list[Future]], futures)
+                total = 0
+                for file in files:
+                    file_futures = []
+                    for anomaly in AnomalyType:
+                        file_futures.append(
+                            executor.submit(
+                                process_signal,
+                                anomaly,
+                                getattr(config, anomaly).th,
+                                getattr(config, anomaly).window_size,
+                                signal_type,
+                                file,
+                                getattr(config, anomaly).stride,
+                            )
+                        )
+                    total += len(file_futures)
+                    futures.append(file_futures)
+
+                    # monitor procceses if they are all finished and updating progress bar
+                    while (
+                        n_finished := sum(
+                            [
+                                sum([future.done() for future in file])
+                                for file in futures
+                            ]
+                        )
+                    ) < total:
+                        progress.update(
+                            experiment_file, completed=n_finished, total=total
+                        )
+
+                progress.update(experiment_file, visible=False)
+
+                anomalies: list[list[Anomaly]] = []
+                for file_futures in futures:
+                    file_anomalies = []
+                    for future in file_futures:
+                        file_anomalies.extend(future.result())
+                    anomalies.append(file_anomalies)
+
         if output:
             if output.is_file():
                 output.unlink()
@@ -123,9 +185,9 @@ def check(
                         opened_file.write(f"{str(anomaly)}\n")
                     opened_file.write("\n")
         else:
-            for file in files:
+            for idx, file in enumerate(files):
                 print(f"file: {file}")
-                for anomaly in anomalies:
+                for anomaly in anomalies[idx]:
                     print(str(anomaly))
                 print()
 
@@ -160,7 +222,9 @@ def graph(
     window_size: Annotated[float, typer.Option(help="set length of the window")] = 2,
     stride: Annotated[
         Union[None, float],
-        typer.Option(help="stride (shift between sections) for rolling window. Shift 1 by default."),
+        typer.Option(
+            help="stride (shift between sections) for rolling window. Shift 1 by default."
+        ),
     ] = None,
 ):
     """
@@ -243,7 +307,9 @@ def look(
         int, typer.Argument(help="start of the looking section (in seconds)")
     ],
     end: Annotated[int, typer.Argument(help="end of the looking section (in seconds)")],
-    peaks: Annotated[bool, typer.Option("--peaks/",help="whether to visualize finded peaks")] = False,
+    peaks: Annotated[
+        bool, typer.Option("--peaks/", help="whether to visualize finded peaks")
+    ] = False,
 ):
     """
     open graph window with time series graph of the specified signal

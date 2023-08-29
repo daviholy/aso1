@@ -1,0 +1,19 @@
+max:
+  th: 100
+  window_size: 2
+  stride: 1
+
+min:
+  th: -60
+  window_size: 2
+  stride: 1
+
+line:
+  th: 2000
+  window_size: 5
+  stride: 5
+
+peaks:
+  th: 0.1
+  window_size: 2
+  stride: 1
