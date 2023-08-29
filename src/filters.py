@@ -1,9 +1,11 @@
 import multiprocessing
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil, floor
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 import seaborn as sns
@@ -30,17 +32,88 @@ class SignalType(str, Enum):
     abp = "ABP"
 
     def __str__(self) -> str:
-        return self.value 
+        return self.value
+
+@dataclass()
+class Anomaly(ABC):
+    start: float
+    end: float
+    type: AnomalyType | list[AnomalyType]
+
+    @abstractmethod
+    def extend(self, other: 'SingleAnomaly | MergedAnomalies'):
+        ...
+    def overlap(self,other: 'SingleAnomaly | MergedAnomalies')-> float:
+        """
+        measuring overlapping area
+
+        Args:
+            other (Self): other measuret segment
+
+        Returns:
+            float: overlapped area relative to other  
+        """
+        if self.end < other.start or other.end < self.start:
+            return 0 
+        if self.start <= other.start:
+            return 1 if self.end >= other.end else (self.end - other.start) / other.length()
+        else:
+            return self.length() / other.length() if self.end <= other.end else (other.end - self.start) / other.length()
+
+    def length(self) -> float:
+        return self.end - self.start
+        
+        
+
 
 
 @dataclass
-class Anomaly:
+class SingleAnomaly(Anomaly):
     type: AnomalyType
-    start: float
-    end: float
+
+    def extend(self, other: Self) -> None:
+        if self.start > other.start:
+            self.start = other.start
+        if self.end < other.end:
+            self.end = other.end
+
+    def convert(self) -> 'MergedAnomalies':
+        return MergedAnomalies(self.start,self.end,[self.type])
 
     def __str__(self) -> str:
         return f"{self.start}-{self.end}: {self.type}"
+
+@dataclass    
+class MergedAnomalies(Anomaly):
+    type: list[AnomalyType]
+
+    def extend(self,other:Self | SingleAnomaly):
+        if self.start > other.start:
+            self.start = other.start
+
+        if self.end < other.end:
+            self.end = other.end
+            
+        if isinstance(other,SingleAnomaly):
+            tmp = set(self.type)
+            tmp.add(other.type)
+            self.type = list(tmp)
+        else:
+            self.type = list(set(self.type).union(other.type))
+        
+    def __str__(self) ->str:
+        return f"{self.start}-{self.end}: {', '.join(self.type)}"
+    
+    @classmethod
+    def join(cls,*arg: SingleAnomaly| Self):
+        start = min([anomaly.start for anomaly in arg])
+        end = max([anomaly.end for anomaly in arg])
+        types = []
+        for anomaly in arg:
+           types.append(anomaly.type) if isinstance(anomaly, SingleAnomaly) else types.extend(anomaly.type)
+        return cls(start,end,list(set(types)))
+    
+
 
 def window_cwt(values: npt.NDArray) -> tuple[npt.NDArray, float]:
     filtered_signal = cwt(values, ricker, [5])[0]
@@ -51,13 +124,13 @@ def window_cwt(values: npt.NDArray) -> tuple[npt.NDArray, float]:
 @dataclass
 class Signal:
     signal: npt.NDArray
-    signal_fs: int # sampling frequency of the signal
+    signal_fs: int  # sampling frequency of the signal
     peaks_per_second: float
-    path: Path 
+    path: Path
     window_indexes: npt.NDArray = field(init=False)
 
     @classmethod
-    def load_signal(cls, path: Path, type: SignalType):
+    def load_signal(cls, path: Path, type: SignalType, cpu_count: int | None = os.cpu_count()):
         """
         load the signal file into memory
 
@@ -68,24 +141,23 @@ class Signal:
         Returns:
             Signal: signal object with loaded signal
         """
+        cpu_count = cpu_count if cpu_count else 1
         signals, fields = wfdb.rdsamp(path)
 
         signal_type = fields["sig_name"].index(type.value)
-        signal: npt.NDArray = signals[:, signal_type].astype(np.float32)
+        signal: npt.NDArray = signals[:, signal_type].astype(np.float64)
+        del signals        
 
-        cpu_count = os.cpu_count()
-        split = np.array_split(signal, cpu_count if cpu_count else 1)
+        split = np.array_split(signal, cpu_count)
+        preprocessed_signal = []
 
-        #preprocess signal in parallel on splitted signal
-        with multiprocessing.Pool() as pool:
+        # preprocess signal in parallel on splitted signal
+        with multiprocessing.Pool(cpu_count) as pool:
             preprocessed_signal = pool.map(window_cwt, split)
-        filtered_signal = np.concatenate(
-            [filtered_signal[0] for filtered_signal in preprocessed_signal]
-        )
 
-        peaks_per_second = np.sum(
-            [peaks_window[1] for peaks_window in preprocessed_signal]
-        ) / (len(signal) / fields["fs"])
+        filtered_signal = np.concatenate([filtered_signal[0] for filtered_signal in preprocessed_signal])
+
+        peaks_per_second = np.sum([peaks_window[1] for peaks_window in preprocessed_signal]) / (len(signal) / fields["fs"])
 
         return cls(
             signal=filtered_signal,
@@ -94,12 +166,7 @@ class Signal:
             path=path,
         )
 
-    def look(
-        self,
-        start: float,
-        end: float,
-        peaks: bool = True
-    ):
+    def look(self, start: float, end: float, peaks: bool = True):
         """
         Open graph window with time series of the signal in specified range. Unit are in the seconds
 
@@ -113,7 +180,9 @@ class Signal:
         sns.lineplot(y=values, x=np.arange(start, end, 1 / self.signal_fs), ax=axes)
         if peaks:
             found_peaks = find_peaks(values)[0]
-            sns.scatterplot(x=(found_peaks / self.signal_fs) + start,y =[values[t] for t in found_peaks], ax = axes, color = PEAK_COLOR)
+            sns.scatterplot(
+                x=(found_peaks / self.signal_fs) + start, y=[values[t] for t in found_peaks], ax=axes, color=PEAK_COLOR
+            )
         plt.show(block=True)
 
     def check(
@@ -122,43 +191,30 @@ class Signal:
         th: float,
         window_size: float = 5,
         stride: float | None = None,
-    ) -> list[Anomaly]:
-        anomalies: list[Anomaly] = []
+    ) -> list[SingleAnomaly]:
+        anomalies: list[SingleAnomaly] = []
         detected = False
         start = 0
         window_size = floor(window_size * self.signal_fs)
         stride = floor(stride * self.signal_fs) if stride else 1
         self.window_indexes = np.arange(0, window_size, 1)
 
-        for idx, window in enumerate(
-            np.lib.stride_tricks.sliding_window_view(self.signal, window_size)[
-                ::stride, :
-            ]
-        ):
+        for idx, window in enumerate(np.lib.stride_tricks.sliding_window_view(self.signal, window_size)[::stride, :]):
             anomaly_index = getattr(self, f"filter_{anomaly}")(window, th=th)
             if isinstance(anomaly_index, int):
                 if not detected:
                     start = anomaly_index + idx * stride
                     detected = True
             elif detected:
-                anomalies.append(
-                    Anomaly(
-                        anomaly, start / self.signal_fs, (idx * stride) / self.signal_fs
-                    )
-                )
+                anomalies.append(SingleAnomaly(start / self.signal_fs, (idx * stride) / self.signal_fs,anomaly))
                 detected = False
 
-
         if detected:
-            anomalies.append(
-                Anomaly(
-                    anomaly, start / self.signal_fs, len(self.signal) / self.signal_fs
-                )
-            )
+            anomalies.append(SingleAnomaly(start / self.signal_fs, len(self.signal) / self.signal_fs, anomaly))
 
         return anomalies
-    
-    #=== filtering functions===
+
+    # === filtering functions===
     def filter_max(
         self,
         window: npt.NDArray,
@@ -171,12 +227,9 @@ class Signal:
         if window.min() <= th:
             return window.argmin().item()
 
-
     def filter_line(self, window: npt.NDArray, th: float = 0.03) -> int | None:
-        _, diag = np.polynomial.Polynomial.fit(
-            self.window_indexes, window, 1, full=True
-        )
-        if diag[0] / len(window) < th:
+        coef = np.polynomial.polynomial.Polynomial.fit(self.window_indexes, window, 1)
+        if np.power(coef(window) - window,2).mean() < th:
             return 0
 
     def filter_peaks(self, window: npt.NDArray, th: float = 0.5):
@@ -184,7 +237,7 @@ class Signal:
         seconds = len(window) / self.signal_fs
         peaks_per_second = len(peaks) / seconds
 
-        if  (peaks_per_second > self.peaks_per_second * (1 + th)
-            or peaks_per_second < self.peaks_per_second * (1 - th)):
-                return 0
-    #==========================
+        if peaks_per_second > self.peaks_per_second * (1 + th) or peaks_per_second < self.peaks_per_second * (1 - th):
+            return 0
+
+    # ==========================

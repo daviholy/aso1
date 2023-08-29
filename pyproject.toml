@@ -25,3 +25,7 @@ debugpy = "^1.6.7.post1"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 125
+target-version = ['py311']
