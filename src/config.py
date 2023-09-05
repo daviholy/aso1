@@ -9,21 +9,29 @@ class _AnomalySetting(BaseModel):
     stride: float
     window_size: float
 
+
 class _TypeConfig(BaseModel):
     max: _AnomalySetting
     min: _AnomalySetting
     line: _AnomalySetting
     peaks: _AnomalySetting
 
+
 class _MergeConfig(BaseModel):
-    max_seconds: float
+    distance: float
     overlap: float
+
 
 class AnomalyConfig(BaseModel):
     ICP: _TypeConfig
     ABP: _TypeConfig
     merge: _MergeConfig
 
+_CONFIG: None | AnomalyConfig = None
 def load_config() -> AnomalyConfig:
-    with open(Path("./config.yaml"), "r") as file:
-        return AnomalyConfig.model_validate(yaml.safe_load(file)) 
+    global _CONFIG
+    
+    if not _CONFIG:
+        with open(Path("./config.yaml"), "r") as file:
+            _CONFIG = AnomalyConfig.model_validate(yaml.safe_load(file))
+    return _CONFIG

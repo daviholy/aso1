@@ -6,7 +6,9 @@ from typing import Annotated, Generator, Union, cast
 
 import numpy as np
 import typer
-from rich.progress import Progress
+import wfdb
+from rich.progress import Progress, TaskID
+from copy import deepcopy
 
 from .config import AnomalyConfig, load_config
 from .filters import AnomalyType, MergedAnomalies, Signal, SignalType, SingleAnomaly
@@ -35,74 +37,107 @@ def process_signal(
     window_size: float,
     signal_type: SignalType,
     file: Path,
+    config: AnomalyConfig,
     stride: float | None,
 ) -> list[SingleAnomaly]:
     signal = Signal.load_signal(file, signal_type)
-    return signal.check(anomaly=anomaly_type, th=experiment, window_size=window_size, stride=stride)
+    return signal.check(anomaly=anomaly_type, th=experiment, window_size=window_size, stride=stride, config=config)
 
 
-def merge_segments(
-    futures: list[list[list[list[SingleAnomaly]]]], config: AnomalyConfig
-) -> list[list[list[list[SingleAnomaly | MergedAnomalies]]]]:
-    # merging close sections of same anomaly together
-    anomalies: list[list[list[list[SingleAnomaly | MergedAnomalies]]]] = []
-    for file in futures:
-        file_anomalies: list[list[list[SingleAnomaly | MergedAnomalies]]] = []
-        for signal in file:
-            merged_anomaly: list[list[SingleAnomaly | MergedAnomalies]] = []
-            for anomaly in signal:
-                merged_segment: list[SingleAnomaly | MergedAnomalies] = []
-                merging = None
-                for segment in anomaly:
-                    if merging is None:
-                        merging = segment
-                        continue
-                    if segment.start - merging.end <= config.merge.max_seconds:
-                        merging.extend(segment)
-                    else:
-                        merged_segment.append(merging)
-                        merging = None
-                if merging is not None:
-                    merged_segment.append(merging)
-                merged_anomaly.append(merged_segment)
-            file_anomalies.append(merged_anomaly)
-        anomalies.append(file_anomalies)
-    return anomalies
+def process_merging(
+    input: list[list[SingleAnomaly | MergedAnomalies]], config: AnomalyConfig
+) -> list[SingleAnomaly | MergedAnomalies]:
+    input = deepcopy(input)
+    ignore = [[False for _ in file] for file in input]
+    if len(input) == 1:
+        return cast(list[SingleAnomaly | MergedAnomalies], input[0])
+    merged_segments: list[SingleAnomaly | MergedAnomalies] = []
+    for index_anomaly, anomaly in enumerate(input):
+        for segment in anomaly:
+            merging: SingleAnomaly | MergedAnomalies = segment
+            while True:
+                try:
+                    for index_anomaly_other, anomaly_other in enumerate(input[index_anomaly:]):
+                        for idx_segment, segment_other in enumerate(anomaly_other):
+                            if (
+                                ignore[index_anomaly + index_anomaly_other][idx_segment]
+                                and merging is not segment_other
+                                and (
+                                    merging.overlap(segment_other) > 0
+                                    or merging.distance(segment_other) <= config.merge.distance
+                                )
+                            ):
+                                merging = MergedAnomalies.join(merging, segment_other)
+                                ignore[index_anomaly + index_anomaly_other][idx_segment] = True
+                                raise Exception()
+                    break
+                except Exception as e:
+                    ...
+            merged_segments.append(merging)
+    return merged_segments
 
+def merge_anomalies(
+    anomalies: list[list[list[list[SingleAnomaly]]]],
+    config: AnomalyConfig,
+    workers: int | None = os.cpu_count(),
+    progress: Progress | None = None,
+) -> list[list[list[SingleAnomaly | MergedAnomalies]]]:
+    total = 0
+    task = TaskID(0)
+    merged_file_anomalies: list[list[list[SingleAnomaly | MergedAnomalies]]] = []
+    futures: list[Future] = []
+    signals_len = len(anomalies[0])
+    if progress:
+        task: TaskID = progress.add_task("merging anomalies", total=total)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for file in anomalies:
+            for signal in file:
+                futures.append(
+                    executor.submit(process_merging, cast(list[list[SingleAnomaly | MergedAnomalies]], signal), config)
+                )
+                total += 1
 
-def merge_anomalies(anomalies: list[list[list[list[SingleAnomaly | MergedAnomalies]]]], config: AnomalyConfig):
-    merged_file_anomalies: list[list[list[MergedAnomalies | SingleAnomaly]]] = []
-    for file in anomalies:
-        merged_signal_anomalies: list[list[MergedAnomalies | SingleAnomaly]] = []
-        for signal in file:
-            if len(signal) == 1:  # if there's only single anomaly, consider it done and skip it
-                merged_signal_anomalies.append(signal[0])
-                continue
-            merged_segments: list[MergedAnomalies | SingleAnomaly] = []
-            for index_anomaly, anomaly in enumerate(signal[:-1]):
-                for segment in anomaly:
-                    merging = segment
-                    while True:
-                        try:
-                            for anomaly_other in signal[index_anomaly + 1 :]:
-                                for idx_segment, segment_other in enumerate(anomaly_other):
-                                    if merging.overlap(segment_other) >= config.merge.overlap:
-                                        if isinstance(merging, SingleAnomaly):
-                                            merging = MergedAnomalies.join(merging, segment_other)
-                                        else:
-                                            merging.extend(segment_other)
-                                        del anomaly_other[idx_segment]
-                                        raise Exception()
-                            break
-                        except Exception as e:
-                            ...
-                    merged_segments.append(merging)
-            merged_segments.extend(
-                signal[-1]
-            )  # consider the unmerged segments from last signals nonoverllaping, so they can be appended to the result.
-            merged_signal_anomalies.append(merged_segments)
-        merged_file_anomalies.append(merged_signal_anomalies)
+        while (n_finished := sum([future.done() for future in futures])) < total:
+            if progress:
+                progress.update(task, completed=n_finished, total=total)
+
+        if progress:
+            progress.update(task, visible=False)
+
+        merged_signal = []
+        for future in futures:
+            merged_signal.append(future.result())
+            if len(merged_signal) == signals_len:
+                merged_file_anomalies.append(merged_signal)
+                merged_signal = []
+
     return merged_file_anomalies
+
+
+def merge_signals(
+    files: list[list[list[SingleAnomaly | MergedAnomalies]]],
+    config: AnomalyConfig,
+    workers: int | None = os.cpu_count(),
+    progress: Progress | None = None,
+) -> list[list[SingleAnomaly | MergedAnomalies]]:
+    total = 0
+    task = TaskID(0)
+    futures: list[Future] = []
+    if progress:
+        task: TaskID = progress.add_task("merging signals", total=total)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        for file in files:
+            futures.append(executor.submit(process_merging, file, config))
+            total += 1
+
+        while (n_finished := sum([future.done() for future in futures])) < total:
+            if progress:
+                progress.update(task, completed=n_finished, total=total)
+
+        if progress:
+            progress.update(task, visible=False)
+
+    return [future.result() for future in futures]
 
 
 @app.callback()
@@ -117,26 +152,12 @@ def main(debug: Annotated[bool, typer.Option(hidden=True)] = False):
 
 @app.command()
 def check(
-    signal_type: Annotated[
-        Union[None, SignalType], typer.Argument(help="which signal type to look at. Check all signals by default")
+    signal: Annotated[
+        Union[None, SignalType], typer.Option(help="which signal type to look at. Check all signals by default")
     ] = None,
-    anomaly_type: Annotated[
+    anomaly: Annotated[
         Union[None, AnomalyType],
-        typer.Argument(help="which anomaly to check for. If not specified check for all anomalies"),
-    ] = None,
-    window_size: Annotated[
-        Union[None, float],
-        typer.Option(help="Set length of the window.  Only works for single anomaly type."),
-    ] = None,
-    th: Annotated[
-        Union[None, float],
-        typer.Option(help="Threshold for looking anomaly. Only works for single anomaly type."),
-    ] = None,
-    stride: Annotated[
-        Union[None, float],
-        typer.Option(
-            help="stride (shift between sections) for rolling window. Shift 1 by default. Only works for single anomaly."
-        ),
+        typer.Option(help="which anomaly to check for. If not specified check for all anomalies"),
     ] = None,
     input: Annotated[
         Path,
@@ -147,90 +168,28 @@ def check(
         typer.Option(help="path to the output file, print to console if not specified"),
     ] = None,
     workers: Annotated[Union[None, int], typer.Option(help="specify how many parallel workers use")] = os.cpu_count(),
-    _return: bool = False,
-) -> None | tuple:
+) -> None | tuple[list[list[SingleAnomaly | MergedAnomalies]], list[str]]:
     """
-    Check and return sectors of given anomaly of specified signal/s
+    Check and return sectors of specified signal/s. Merge all signals and anomaly types if not specified
     """
-    config = load_config()
     files = list(dataset_files(input))
-    workers = workers if workers else 1
     with Progress() as progress:
-        experiment_file = progress.add_task(
-            "iterating over files",
-            total=len(files),
-        )
-        futures: list[list[list[Future[list[SingleAnomaly]]]]] = []
-
-        types = [anomaly_type] if anomaly_type else [anomaly for anomaly in AnomalyType]
-        signal_types = [signal_type] if signal_type else [signal for signal in SignalType]
-        # start processing files on separate processes
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            total = 0
-            for file in files:
-                file_futures = []
-                for signal in signal_types:
-                    signal_futures = []
-                    config_type = getattr(config, str(signal))
-                    for segment in types:
-                        signal_futures.append(
-                            executor.submit(
-                                process_signal,
-                                segment,
-                                getattr(config_type, segment).th,
-                                getattr(config_type, segment).window_size,
-                                signal,
-                                file,
-                                getattr(config_type, segment).stride,
-                            )
-                        )
-                    total += len(signal_futures)
-                    file_futures.append(signal_futures)
-                futures.append(file_futures)
-
-            # monitor procceses if they are all finished and updating progress bar
-            while (
-                n_finished := sum([sum([sum([future.done() for future in signal]) for signal in file]) for file in futures])
-            ) < total:
-                progress.update(experiment_file, completed=n_finished, total=total)
-
-        progress.update(experiment_file, visible=False)
-
-        #unpack all result segmetns form fututres
-        segments: list[list[list[list[SingleAnomaly]]]] = [
-            [[future.result() for future in signal] for signal in file] for file in futures
-        ]
-
-        merged_segments = merge_segments(segments, config)# merge close segments of same anomaly type
-        merged_anomalies = merge_anomalies(merged_segments, config)# merge overlapping segments
-
-        for file in merged_anomalies:
-            for signal in file:
-                for segment in signal:
-                    segment = segment if isinstance(segment,MergedAnomalies) else segment.convert()
-        
-        signal_type_names = [str(type) for type in signal_types]
-        if _return:
-            return merged_anomalies, signal_type_names
-
-        if output:
-            if output.is_file():
-                output.unlink()
-            with open(output, "a") as opened_file:
-                for index, file in enumerate(files):
-                    opened_file.write(f"file: {file}\n")
-                    for idx, signal in enumerate(merged_anomalies[index]):
-                        opened_file.write(f"{signal_type_names[idx]}\n")
-                        signal = signal if isinstance(signal, list) else [signal]
-                        for segment in signal:
-                            opened_file.write(f"{str(segment)}\n")
-                    opened_file.write("\n")
-        else:
-            for idx, file in enumerate(files):
-                print(f"file: {file}")
-                for segment in merged_anomalies[idx]:
-                    print(str(segment))
-                print()
+        merged_signals, types = _check(signal, anomaly, input, workers, progress)
+    if output:
+        if output.is_file():
+            output.unlink()
+        with open(output, "a") as opened_file:
+            for index, file in enumerate(files):
+                opened_file.write(f"file: {file}\n")
+                for idx, segment in enumerate(merged_signals[index]):
+                    opened_file.write(f"{str(segment)}\n")
+                opened_file.write("\n")
+    else:
+        for idx, file in enumerate(files):
+            print(f"file: {file}")
+            for segment in merged_signals[idx]:
+                print(str(segment))
+            print()
 
 
 @app.command()
@@ -241,11 +200,11 @@ def graph(
     x_axis_title: Annotated[str, typer.Option(help="title for the y axis")],
     y_axis_title: Annotated[str, typer.Option(help="title for the x axis")],
     title: Annotated[str, typer.Option(help="title for the graph")],
-    signal_type: Annotated[SignalType, typer.Argument(help="which signal type to look at")],
-    anomaly_type: Annotated[AnomalyType, typer.Argument(help="which anomaly to observe")],
+    signal: Annotated[SignalType, typer.Argument(help="which signal type to look at")],
+    anomaly: Annotated[AnomalyType, typer.Argument(help="which anomaly to observe")],
     output: Annotated[Path, typer.Option(help="file path where to store the result graph")],
     input: Annotated[
-        Union[None, Path],
+        Path,
         typer.Option(
             help="input path. for file without suffix, will test only this file. for folder, test all files with .dat suffix"
         ),
@@ -255,6 +214,7 @@ def graph(
         Union[None, float],
         typer.Option(help="stride (shift between sections) for rolling window. Shift 1 by default."),
     ] = None,
+    workers: Annotated[Union[None, int], typer.Option(help="specify how many parallel workers use")] = os.cpu_count(),
 ):
     """
     Test the specified anomaly type in the given threshold range and create graph. Units are in the seconds
@@ -262,53 +222,32 @@ def graph(
     import plotly.express as px
 
     x = []
-    y = []
-    threshold_range = list(np.linspace(start, end, ceil((end - start) / step) + 1))
+    y_count = []
+    y_time = []
+
+    config = load_config()
+    config_anomaly = getattr(getattr(config, signal), anomaly)
+
+    config_anomaly.stride = stride
+    config_anomaly.window_size = window_size
     with Progress() as progress:
-        experiments_task = progress.add_task("iterating over experiments", total=len(threshold_range))
+        experiment_id = progress.add_task("iterating over experiments", total=len(np.arange(start, end, step)))
+        for experiment in np.arange(start, end, step):
+            config_anomaly.th = experiment
 
-        for experiment in threshold_range:
-            futures: list[Future] = []
-            # load the all neccesary files
-            files = list(dataset_files(input))
+            result, types = _check(signal=signal, anomaly=anomaly, input=input, workers=workers, progress=progress)
 
-            experiment_file = progress.add_task(
-                "iterating over files",
-                total=len(files),
-            )
-            # start processing files on separate processes
-            with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-                for file in files:
-                    futures.append(
-                        executor.submit(
-                            process_signal,
-                            anomaly_type,
-                            experiment,
-                            window_size,
-                            signal_type,
-                            file,
-                            stride,
-                        )
-                    )
-
-                # monitor procceses if they are all finished and updating progress bar
-                while (n_finished := sum([future.done() for future in futures])) < len(futures):
-                    progress.update(experiment_file, completed=n_finished, total=len(futures))
-
-            progress.update(experiment_file, visible=False)
-
-            # result gathering
             x.append(float(experiment))
-            y.append(sum([len(future.result()) for future in futures]))
+            y_count.append(sum([len(file) for file in result]))
+            y_time.append(sum([sum(segment.length() for segment in file) for file in result]))
 
-            progress.update(experiments_task, advance=1)
+            progress.update(experiment_id, advance=1)
+        progress.update(experiment_id, visible=False)
 
-        progress.update(experiments_task, visible=False)
-
-    # creating graph
+    # creating graph with counted segments
     fig = px.line(
         x=x,
-        y=y,
+        y=y_count,
         markers=True,
         title=title,
     )
@@ -317,7 +256,21 @@ def graph(
         yaxis_title=y_axis_title,
         titlefont={"size": 30},
     )
-    fig.write_image(output)
+    fig.write_image(output.with_stem(f"{output.stem}_count"))
+
+    # creating graph with summed total time
+    fig = px.line(
+        x=x,
+        y=y_time,
+        markers=True,
+        title=title,
+    )
+    fig.update_layout(
+        xaxis_title=x_axis_title,
+        yaxis_title=y_axis_title,
+        titlefont={"size": 30},
+    )
+    fig.write_image(output.with_stem(f"{output.stem}_time"))
 
 
 @app.command()
@@ -332,6 +285,81 @@ def look(
     open graph window with time series graph of the specified signal
     """
     Signal.load_signal(input, signal_type).look(start, end, peaks)
+
+
+def _check(
+    signal: None | SignalType = None,
+    anomaly: None | AnomalyType = None,
+    input: Path | None = None,
+    workers: None | int = os.cpu_count(),
+    progress: None | Progress = None,
+) -> tuple[list[list[SingleAnomaly | MergedAnomalies]], list[str]]:
+    files = list(dataset_files(input))
+    config = load_config()
+    workers = workers if workers else 1
+    progress = progress if progress else Progress()
+    experiment_file = progress.add_task(
+        "iterating over files",
+        total=len(files),
+    )
+    futures: list[list[list[Future[list[SingleAnomaly]]]]] = []
+
+    types = [anomaly] if anomaly else [anomaly for anomaly in AnomalyType]
+    signal_types = [signal] if signal else [signal for signal in SignalType]
+    # start processing files on separate processes
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        total = 0
+        for file in files:
+            file_futures = []
+            for signal in signal_types:
+                signal_futures = []
+                config_type = getattr(config, str(signal))
+                for segment in types:
+                    signal_futures.append(
+                        executor.submit(
+                            process_signal,
+                            segment,
+                            getattr(config_type, segment).th,
+                            getattr(config_type, segment).window_size,
+                            signal,
+                            file,
+                            config,
+                            getattr(config_type, segment).stride,
+                        )
+                    )
+                total += len(signal_futures)
+                file_futures.append(signal_futures)
+            futures.append(file_futures)
+
+        # monitor procceses if they are all finished and updating progress bar
+        while (
+            n_finished := sum([sum([sum([future.done() for future in signal]) for signal in file]) for file in futures])
+        ) < total:
+            progress.update(experiment_file, completed=n_finished, total=total)
+
+    progress.update(experiment_file, visible=False)
+    if not progress:
+        progress.__exit__()
+
+    # unpack all result segments from futures
+    segments: list[list[list[list[SingleAnomaly]]]] = [
+        [[future.result() for future in signal] for signal in file] for file in futures
+    ]
+    merged_anomalies = merge_anomalies(segments, config, workers, progress)  # merge overlapping segments
+    if len(merged_anomalies[0]) == 1:  # check if there's single signal. Assuming that it's same for all files
+        merged_signals = [signal[0] for signal in merged_anomalies]  # unpack the single signal
+    else:
+        merged_signals: list[list[SingleAnomaly | MergedAnomalies]] = merge_signals(
+            merged_anomalies, config, workers, progress
+        )
+
+    for file in merged_signals:
+        for segment in file:
+            segment = cast(MergedAnomalies | SingleAnomaly, segment)
+            segment = segment if isinstance(segment, MergedAnomalies) else segment.convert()
+
+    signal_type_names = [str(type) for type in signal_types]
+    return merged_signals, signal_type_names
 
 
 if __name__ == "__main__":

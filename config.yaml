@@ -1,44 +1,44 @@
 ABP:
   max:
     th: 240
-    window_size: 2
+    window_size: 5
     stride: 1
 
   min:
-    th: -140
-    window_size: 2
+    th: -10
+    window_size: 5
     stride: 1
 
   line:
-    th: 5000
+    th: 0.1
     window_size: 10
     stride: 10
 
   peaks:
-    th: 0.7
-    window_size: 1
-    stride: 5
+    th: 0.8
+    window_size: 5
+    stride: 1
 ICP:
   max:
-    th: 40
-    window_size: 1
+    th: 250
+    window_size: 5
     stride: 1
 
   min:
-    th: -30
-    window_size: 1
-    stride: 5
+    th: -10
+    window_size: 5
+    stride: 1
 
   line:
-    th: 40
+    th: 0.1
     window_size: 10
     stride: 10
 
   peaks:
-    th: 0.9
-    window_size: 1
-    stride: 5
+    th: 1.00
+    window_size: 5
+    stride: 1
 
 merge:
-  max_seconds: 1
+  distance: 1
   overlap: 0.3
