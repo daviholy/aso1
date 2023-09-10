@@ -16,16 +16,10 @@ class _TypeConfig(BaseModel):
     line: _AnomalySetting
     peaks: _AnomalySetting
 
-
-class _MergeConfig(BaseModel):
-    distance: float
-    overlap: float
-
-
 class AnomalyConfig(BaseModel):
     ICP: _TypeConfig
     ABP: _TypeConfig
-    merge: _MergeConfig
+    distance: float
 
 _CONFIG: None | AnomalyConfig = None
 def load_config() -> AnomalyConfig:

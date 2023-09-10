@@ -149,7 +149,7 @@ class MergedAnomalies(Anomaly):
             id = overlaps.index(max(overlaps))
             if overlaps[id] == 0:
                 id_dist = distances.index(min(distances))
-                if distances[id_dist] <= load_config().merge.distance:
+                if distances[id_dist] <= load_config().distance:
                     anomalies[id_dist].extend(deepcopy(other))
                 else:
                     anomalies.append(deepcopy(other))
@@ -279,9 +279,6 @@ class Signal:
         self.window_indexes = np.arange(0, window_size, 1)
         prev_anomaly: SingleAnomaly | None = None
 
-        if anomaly == AnomalyType.line:
-            ...
-
         for idx, window in enumerate(np.lib.stride_tricks.sliding_window_view(self.signal, window_size)[::stride, :]):
             anomaly_index = getattr(self, f"filter_{anomaly}")(window, th=th)
             if isinstance(anomaly_index,tuple):
@@ -291,7 +288,7 @@ class Signal:
                 index =idx * stride + anomaly_index[1]
             elif detected:
                 current_anomaly = SingleAnomaly(start / self.fs, index / self.fs, anomaly)
-                if prev_anomaly and prev_anomaly.distance(current_anomaly) <= config.merge.distance:
+                if prev_anomaly and prev_anomaly.distance(current_anomaly) <= config.distance:
                     prev_anomaly.extend(current_anomaly)
                     continue
                 
@@ -301,10 +298,11 @@ class Signal:
 
         if detected:
             current_anomaly = SingleAnomaly(start / self.fs, index / self.fs, anomaly)
-            if prev_anomaly and prev_anomaly.distance(current_anomaly) <= config.merge.distance:
+            if prev_anomaly and prev_anomaly.distance(current_anomaly) <= config.distance:
                 prev_anomaly.extend(current_anomaly)
             else:
                 anomalies.append(current_anomaly)
+
 
         return anomalies
 

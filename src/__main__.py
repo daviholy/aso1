@@ -64,7 +64,7 @@ def process_merging(
                                 and merging is not segment_other
                                 and (
                                     merging.overlap(segment_other) > 0
-                                    or merging.distance(segment_other) <= config.merge.distance
+                                    or merging.distance(segment_other) <= config.distance
                                 )
                             ):
                                 merging = MergedAnomalies.join(merging, segment_other)
@@ -156,7 +156,7 @@ def check(
         Union[None, SignalType], typer.Option(help="which signal type to look at. Check all signals by default")
     ] = None,
     anomaly: Annotated[
-        Union[None, AnomalyType],
+        Union[None, list[AnomalyType]],
         typer.Option(help="which anomaly to check for. If not specified check for all anomalies"),
     ] = None,
     input: Annotated[
@@ -174,7 +174,7 @@ def check(
     """
     files = list(dataset_files(input))
     with Progress() as progress:
-        merged_signals, types = _check(signal, anomaly, input, workers, progress)
+        merged_signals, types = _check([signal] if isinstance(signal,SignalType) else signal, anomaly, input, workers, progress)
     if output:
         if output.is_file():
             output.unlink()
@@ -198,8 +198,8 @@ def graph(
     end: Annotated[float, typer.Option(help="ending value of the testing threshold (inclusive)")],
     step: Annotated[float, typer.Option(help="step size of the testing threshold")],
     x_axis_title: Annotated[str, typer.Option(help="title for the y axis")],
-    y_axis_title: Annotated[str, typer.Option(help="title for the x axis")],
-    title: Annotated[str, typer.Option(help="title for the graph")],
+    y_axis_title_count: Annotated[str, typer.Option(help="title for the x axis of count plot")],
+    y_axis_title_time: Annotated[str, typer.Option(help="title for the x axis of the time plot")],
     signal: Annotated[SignalType, typer.Argument(help="which signal type to look at")],
     anomaly: Annotated[AnomalyType, typer.Argument(help="which anomaly to observe")],
     output: Annotated[Path, typer.Option(help="file path where to store the result graph")],
@@ -235,7 +235,7 @@ def graph(
         for experiment in np.arange(start, end, step):
             config_anomaly.th = experiment
 
-            result, types = _check(signal=signal, anomaly=anomaly, input=input, workers=workers, progress=progress)
+            result, types = _check(signal=[signal], anomaly=[anomaly], input=input, workers=workers, progress=progress)
 
             x.append(float(experiment))
             y_count.append(sum([len(file) for file in result]))
@@ -249,12 +249,11 @@ def graph(
         x=x,
         y=y_count,
         markers=True,
-        title=title,
     )
     fig.update_layout(
         xaxis_title=x_axis_title,
-        yaxis_title=y_axis_title,
-        titlefont={"size": 30},
+        yaxis_title=y_axis_title_count,
+        font={"size": 30},
     )
     fig.write_image(output.with_stem(f"{output.stem}_count"))
 
@@ -263,12 +262,11 @@ def graph(
         x=x,
         y=y_time,
         markers=True,
-        title=title,
     )
     fig.update_layout(
         xaxis_title=x_axis_title,
-        yaxis_title=y_axis_title,
-        titlefont={"size": 30},
+        yaxis_title=y_axis_title_time,
+        font={"size": 30},
     )
     fig.write_image(output.with_stem(f"{output.stem}_time"))
 
@@ -288,8 +286,8 @@ def look(
 
 
 def _check(
-    signal: None | SignalType = None,
-    anomaly: None | AnomalyType = None,
+    signal: None | list[SignalType] = None,
+    anomaly: None | list[AnomalyType] = None,
     input: Path | None = None,
     workers: None | int = os.cpu_count(),
     progress: None | Progress = None,
@@ -304,16 +302,16 @@ def _check(
     )
     futures: list[list[list[Future[list[SingleAnomaly]]]]] = []
 
-    types = [anomaly] if anomaly else [anomaly for anomaly in AnomalyType]
-    signal_types = [signal] if signal else [signal for signal in SignalType]
+    types = anomaly if anomaly else [anomaly for anomaly in AnomalyType]
+    signal_types = signal if signal else [signal for signal in SignalType]
     # start processing files on separate processes
     with ProcessPoolExecutor(max_workers=workers) as executor:
         total = 0
         for file in files:
             file_futures = []
-            for signal in signal_types:
+            for current_signal in signal_types:
                 signal_futures = []
-                config_type = getattr(config, str(signal))
+                config_type = getattr(config, str(current_signal))
                 for segment in types:
                     signal_futures.append(
                         executor.submit(
@@ -321,7 +319,7 @@ def _check(
                             segment,
                             getattr(config_type, segment).th,
                             getattr(config_type, segment).window_size,
-                            signal,
+                            current_signal,
                             file,
                             config,
                             getattr(config_type, segment).stride,
